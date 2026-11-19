@@ -115,6 +115,33 @@ To operate soundly without making unsupported protocol assumptions:
 
 ## 5. Usage Guide & Output Examples
 
+### Check a fleet from a manifest
+
+Copy `sentinel.example.toml` to `sentinel.toml` and replace the sample contract IDs
+with your own. Run a single check in manifest order.
+
+```bash
+sentinel check --config sentinel.toml
+sentinel check --config sentinel.toml --format json
+```
+
+The optional `[defaults]` table sets the network, public RPC URL, and warning
+and critical thresholds in ledgers. Each `[[contracts]]` table requires an
+`id` and can specify a `name`, `keys`, `key_xdr`, and either threshold.
+`SOROBAN_RPC_URL` overrides the manifest endpoint. Set credentials in the
+environment. The command validates the entire manifest before querying the
+network and accepts up to 100 contracts in a file of up to 256 KiB.
+
+Text shows each contract and an overall summary. JSON contains an ordered
+`contracts` array and a `summary` object with counts by outcome. Every contract
+result contains `id`, `name`, `status`, `report`, and `error` fields. Unavailable
+values are null.
+
+The command continues after an individual RPC failure. Any RPC failure takes
+precedence and exits 11. Otherwise the worst contract result determines the
+exit code (0 for OK, 1 for warning, 2 for critical or archived). Invalid input
+exits 10 before any RPC requests.
+
 ### Quickstart: Building from Source
 ```bash
 # Clone and build release binary

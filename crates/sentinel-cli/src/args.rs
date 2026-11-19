@@ -20,6 +20,8 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Bundle contract and persistent-key TTL extensions into simulated transactions
     Bundle(BundleArgs),
+    /// Scan contracts once from a TOML manifest
+    Check(CheckArgs),
 }
 
 /// Command-line arguments for the `sentinel scan` command.
@@ -124,6 +126,19 @@ pub struct BundleArgs {
     /// Inclusion fee per operation in stroops used when constructing each envelope
     #[arg(long = "base-fee", default_value_t = 100, value_name = "STROOPS")]
     pub base_fee: u32,
+/// Command-line arguments for a one-shot manifest check.
+#[derive(Args, Debug)]
+#[command(
+    after_help = "Exit codes: 0 OK, 1 warning, 2 critical or archived, 10 invalid input, 11 RPC failure. Any RPC failure takes precedence over risk results."
+)]
+pub struct CheckArgs {
+    /// Path to the fleet manifest
+    #[arg(long, default_value = "sentinel.toml", value_name = "PATH")]
+    pub config: std::path::PathBuf,
+
+    /// Report format
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+    pub format: String,
 }
 
 #[cfg(test)]
@@ -157,6 +172,7 @@ mod tests {
                 assert!(!scan.fail_on_regression);
             }
             Commands::Bundle(_) => panic!("expected scan command"),
+            _ => panic!("expected scan command"),
         }
     }
 
@@ -250,6 +266,7 @@ mod tests {
                 assert_eq!(bundle.network, "testnet");
             }
             Commands::Scan(_) => panic!("expected bundle command"),
+            _ => panic!("expected scan command"),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Core pure domain models and calculations.
 
 pub mod bundle;
+pub mod cold_storage;
 pub mod compare;
 pub mod entry;
 pub mod risk;

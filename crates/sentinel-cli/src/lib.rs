@@ -4,6 +4,7 @@
 
 pub mod args;
 pub mod commands;
+pub mod config;
 pub mod formatters;
 
 pub use args::{BundleArgs, Cli, Commands, ScanArgs};
