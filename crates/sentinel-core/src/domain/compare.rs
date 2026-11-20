@@ -257,6 +257,8 @@ mod tests {
             ledger_velocity_seconds: 5.0,
             entries,
             overall_status: RiskLevel::Ok,
+            archival_recommendations: Vec::new(),
+            sac_asset_info: None,
         }
     }
 

@@ -1,16 +1,23 @@
 //! Use case orchestrator for scanning Soroban smart contract storage TTL and expiration risk.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{ReadXdr, WriteXdr};
 
 use crate::adapters::{
     derive_contract_code_key, derive_contract_instance_key, derive_persistent_key_from_scval,
-    derive_persistent_symbol_key, derive_persistent_xdr_key, extract_wasm_hash_from_instance_entry,
-    parse_contract_id, parse_key_expr, safe_xdr_limits,
+    derive_persistent_symbol_key, derive_persistent_xdr_key, extract_instance_storage_breakdown,
+    extract_sac_asset_info, extract_wasm_hash_from_instance_entry, parse_contract_id,
+    parse_key_expr, safe_xdr_limits,
+};
+use crate::domain::cold_storage::{
+    recommend_archival, ArchivalPolicy, ArchivalRecommendation, ExtensionHistory,
 };
 use crate::domain::{
     calculate_remaining_ledgers, estimate_remaining_days, estimate_remaining_seconds_with_velocity,
-    evaluate_risk, Durability, EntryType, RiskLevel, ThresholdConfig, TARGET_LEDGER_CLOSE_SECONDS,
+    evaluate_risk, Durability, EntryType, InstanceStorageBreakdown, RentDebt, RentDebtCalculator,
+    RiskLevel, SacAssetInfo, StorageEntry, ThresholdConfig, TARGET_LEDGER_CLOSE_SECONDS,
 };
 use crate::error::SentinelResult;
 use crate::ports::reader::LedgerReader;
@@ -124,6 +131,9 @@ pub struct StorageEntryReport {
     pub remaining_days: f64,
     /// Risk status classification.
     pub status: RiskLevel,
+    /// Per-key breakdown of instance-scoped state inside `ScContractInstance.storage`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_storage_keys: Vec<InstanceStorageBreakdown>,
 }
 
 impl StorageEntryReport {
@@ -150,7 +160,14 @@ impl StorageEntryReport {
             estimated_remaining_seconds,
             remaining_days,
             status,
+            instance_storage_keys: Vec::new(),
         }
+    }
+
+    /// Sets the instance storage keys breakdown.
+    pub fn with_instance_storage_keys(mut self, keys: Vec<InstanceStorageBreakdown>) -> Self {
+        self.instance_storage_keys = keys;
+        self
     }
 }
 
@@ -169,9 +186,34 @@ pub struct TTLReport {
     pub entries: Vec<StorageEntryReport>,
     /// Aggregate overall risk status for the contract.
     pub overall_status: RiskLevel,
+    /// Advisory projections for eligible persistent entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archival_recommendations: Vec<ArchivalRecommendation>,
+    /// Extracted metadata if the contract is a Stellar Asset Contract (SAC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sac_asset_info: Option<SacAssetInfo>,
 }
 
 impl TTLReport {
+    /// Calculate per-entry restoration rent and modeled arrears using this scan's TTL observations.
+    /// Entries absent from RPC need a known historical TTL and size supplied to the calculator directly.
+    /// Results use the scan's measured or estimated entry sizes.
+    pub fn rent_debts<'a>(
+        &'a self,
+        calculator: &'a RentDebtCalculator,
+    ) -> impl Iterator<Item = (&'a StorageEntryReport, RentDebt)> + 'a {
+        self.entries.iter().filter_map(move |entry| {
+            let byte_size = u32::try_from(entry.byte_size).ok()?;
+            let debt = calculator.calculate(
+                entry.durability,
+                byte_size,
+                entry.live_until_ledger,
+                self.latest_ledger,
+            )?;
+            Some((entry, debt))
+        })
+    }
+
     /// Calculates aggregate summary counts across all evaluated entries.
     pub fn summary(&self) -> ReportSummary {
         let mut ok = 0;
@@ -221,6 +263,7 @@ pub fn compute_overall_status(entries: &[StorageEntryReport]) -> RiskLevel {
 }
 
 /// Safely computes the binary byte size from base64 XDR string.
+#[tracing::instrument(skip(entry_xdr_base64), fields(xdr.base64_len = entry_xdr_base64.len()))]
 fn compute_byte_size(entry_xdr_base64: &str) -> usize {
     if let Ok(entry) =
         stellar_xdr::curr::LedgerEntry::from_xdr_base64(entry_xdr_base64, safe_xdr_limits())
@@ -250,15 +293,40 @@ fn compute_byte_size(entry_xdr_base64: &str) -> usize {
     }
 }
 
+/// Fuzzing entry point for the scan byte-size computation.
+///
+/// Keeps the production helper private while allowing the fuzz target in `fuzz/`
+/// to exercise it with arbitrary base64 XDR text.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_compute_byte_size(entry_xdr_base64: &str) -> usize {
+    compute_byte_size(entry_xdr_base64)
+}
+
 /// Application orchestrator for scanning Soroban smart contract storage TTL and expiration risk.
 pub struct ScanContractUseCase<R: LedgerReader> {
     reader: R,
+    archival: Option<(ArchivalPolicy, HashMap<String, ExtensionHistory>)>,
 }
 
 impl<R: LedgerReader> ScanContractUseCase<R> {
     /// Creates a new `ScanContractUseCase` with the given reader.
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            archival: None,
+        }
+    }
+
+    /// Enable advisory analysis with complete histories keyed by canonical ledger-key XDR.
+    /// Histories and fee estimates must belong to the network being scanned.
+    pub fn with_archival_analysis(
+        mut self,
+        policy: ArchivalPolicy,
+        histories: HashMap<String, ExtensionHistory>,
+    ) -> Self {
+        self.archival = Some((policy, histories));
+        self
     }
 
     /// Returns a reference to the underlying reader.
@@ -267,6 +335,15 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
     }
 
     /// Executes the full contract scan workflow.
+    #[tracing::instrument(
+        skip(self, request),
+        fields(
+            contract_id = %request.contract_id_strkey,
+            network = request.network.as_deref().unwrap_or("testnet"),
+            entry.count = tracing::field::Empty,
+            overall.status = tracing::field::Empty
+        )
+    )]
     pub async fn execute(&self, request: ScanRequest) -> SentinelResult<TTLReport> {
         let contract_id_bytes = parse_contract_id(&request.contract_id_strkey)?;
         request.threshold_config.validate()?;
@@ -328,6 +405,7 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
             .find(|e| e.key_xdr_base64 == instance_key_xdr);
 
         let mut wasm_hash_opt: Option<[u8; 32]> = None;
+        let mut sac_asset_info_opt: Option<SacAssetInfo> = None;
 
         if let Some(entry) = instance_entry_opt {
             let byte_size = compute_byte_size(&entry.entry_xdr_base64);
@@ -338,7 +416,7 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
             let remaining_days = estimate_remaining_days(remaining_seconds);
             let status = evaluate_risk(remaining_ledgers, &request.threshold_config);
 
-            reports.push(StorageEntryReport::new(
+            let mut instance_report = StorageEntryReport::new(
                 "instance",
                 EntryType::ContractInstance,
                 Durability::Instance,
@@ -348,7 +426,20 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
                 remaining_seconds,
                 remaining_days,
                 status,
-            ));
+            );
+
+            // Extract breakdown of embedded storage map keys
+            if let Ok(keys_breakdown) = extract_instance_storage_breakdown(&entry.entry_xdr_base64)
+            {
+                instance_report.instance_storage_keys = keys_breakdown;
+            }
+
+            reports.push(instance_report);
+
+            // Extract SAC AssetInfo if contract is a Stellar Asset Contract
+            sac_asset_info_opt = extract_sac_asset_info(&entry.entry_xdr_base64)
+                .ok()
+                .flatten();
 
             // Extract WASM hash if executable is WASM bytecode
             wasm_hash_opt = extract_wasm_hash_from_instance_entry(&entry.entry_xdr_base64)
@@ -416,6 +507,9 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
             }
         }
 
+        let mut archival_recommendations = Vec::new();
+        let mut evaluated_keys = HashSet::new();
+
         // 6. Process Persistent entries
         for (ident, key_xdr) in persistent_descriptors {
             let found_entry = raw_entries.iter().find(|e| e.key_xdr_base64 == key_xdr);
@@ -428,6 +522,28 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
                     estimate_remaining_seconds_with_velocity(remaining_ledgers, ledger_velocity);
                 let remaining_days = estimate_remaining_days(remaining_seconds);
                 let status = evaluate_risk(remaining_ledgers, &request.threshold_config);
+
+                if let Some((policy, histories)) = &self.archival {
+                    if let Some(history) = histories.get(&key_xdr) {
+                        if key_xdr != instance_key_xdr && evaluated_keys.insert(key_xdr) {
+                            let profile = StorageEntry::new(
+                                &ident,
+                                EntryType::PersistentData,
+                                Durability::Persistent,
+                                byte_size,
+                                live_until,
+                                entry.last_modified_ledger_seq,
+                            );
+                            archival_recommendations.extend(recommend_archival(
+                                &profile,
+                                *history,
+                                policy,
+                                latest_ledger,
+                                ledger_velocity,
+                            ));
+                        }
+                    }
+                }
 
                 reports.push(StorageEntryReport::new(
                     ident,
@@ -457,6 +573,9 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
         }
 
         let overall_status = compute_overall_status(&reports);
+        let span = tracing::Span::current();
+        span.record("entry.count", reports.len() as u64);
+        span.record("overall.status", tracing::field::display(overall_status));
 
         Ok(TTLReport {
             contract_id: request.contract_id_strkey,
@@ -465,6 +584,8 @@ impl<R: LedgerReader> ScanContractUseCase<R> {
             ledger_velocity_seconds: ledger_velocity,
             entries: reports,
             overall_status,
+            archival_recommendations,
+            sac_asset_info: sac_asset_info_opt,
         })
     }
 }
@@ -746,6 +867,14 @@ mod tests {
             .any(|e| e.status == RiskLevel::Critical));
     }
 
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn test_fuzz_compute_byte_size_handles_malformed_input() {
+        assert_eq!(fuzz_compute_byte_size(""), 0);
+        assert_eq!(fuzz_compute_byte_size("!!!"), 2);
+        assert!(fuzz_compute_byte_size("not-valid-xdr-base64!!") > 0);
+    }
+
     #[test]
     fn test_compute_overall_status_precedence() {
         let make_entry = |status: RiskLevel| {
@@ -862,5 +991,108 @@ mod tests {
         assert_eq!(inst.estimated_remaining_seconds, 600_000.0);
         // 600,000 / 86400 ~= 6.9444 days
         assert!((inst.remaining_days - 6.9444).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn test_scan_stellar_asset_contract_extracts_sac_metadata() {
+        let contract_bytes = [60u8; 32];
+        let contract_strkey = stellar_strkey::Contract(contract_bytes).to_string();
+
+        let instance_key = derive_contract_instance_key(&contract_bytes).unwrap();
+        let entry_data = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(Hash(contract_bytes)),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::StellarAsset,
+                storage: None,
+            }),
+        });
+        let instance_xdr = entry_data.to_xdr_base64(Limits::none()).unwrap();
+
+        let instance_raw = RawLedgerEntry::new(&instance_key, &instance_xdr, 6_000_000, 5_400_000);
+        let mock_reader = MockLedgerReader::new()
+            .with_latest_ledger(5_400_000, 22)
+            .with_entry(instance_raw);
+
+        let usecase = ScanContractUseCase::new(mock_reader);
+        let request = ScanRequest::new(&contract_strkey);
+
+        let report = usecase.execute(request).await.unwrap();
+
+        assert!(report.sac_asset_info.is_some());
+        let info = report.sac_asset_info.unwrap();
+        assert!(info.is_native);
+        assert_eq!(info.symbol, Some("XLM".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_instance_storage_breakdown_surface() {
+        use stellar_xdr::curr::{ScMap, ScMapEntry};
+
+        let contract_bytes = [70u8; 32];
+        let contract_strkey = stellar_strkey::Contract(contract_bytes).to_string();
+
+        let instance_key = derive_contract_instance_key(&contract_bytes).unwrap();
+        let storage_map = ScMap(
+            vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol("AdminKey".try_into().unwrap())),
+                val: ScVal::U32(1),
+            }]
+            .try_into()
+            .unwrap(),
+        );
+
+        let entry_data = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(Hash(contract_bytes)),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::Wasm(Hash([71u8; 32])),
+                storage: Some(storage_map),
+            }),
+        });
+        let instance_xdr = entry_data.to_xdr_base64(Limits::none()).unwrap();
+
+        let code_key = derive_contract_code_key(&[71u8; 32]).unwrap();
+        let code_entry_data = LedgerEntryData::ContractCode(ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: Hash([71u8; 32]),
+            code: vec![0u8; 64].try_into().unwrap(),
+        });
+        let code_xdr = code_entry_data.to_xdr_base64(Limits::none()).unwrap();
+
+        let instance_raw = RawLedgerEntry::new(&instance_key, &instance_xdr, 6_000_000, 5_400_000);
+        let code_raw = RawLedgerEntry::new(&code_key, &code_xdr, 6_000_000, 5_400_000);
+
+        let mock_reader = MockLedgerReader::new()
+            .with_latest_ledger(5_400_000, 22)
+            .with_entry(instance_raw)
+            .with_entry(code_raw);
+
+        let usecase = ScanContractUseCase::new(mock_reader);
+        let request = ScanRequest::new(&contract_strkey);
+
+        let report = usecase.execute(request).await.unwrap();
+
+        let instance_rep = report
+            .entries
+            .iter()
+            .find(|e| e.key_identifier == "instance")
+            .unwrap();
+        assert_eq!(instance_rep.instance_storage_keys.len(), 1);
+        assert_eq!(
+            instance_rep.instance_storage_keys[0].key_summary,
+            "AdminKey"
+        );
+
+        let code_rep = report
+            .entries
+            .iter()
+            .find(|e| e.key_identifier == "code_wasm")
+            .unwrap();
+        assert!(code_rep.instance_storage_keys.is_empty());
     }
 }

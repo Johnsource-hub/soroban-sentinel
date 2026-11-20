@@ -1,6 +1,8 @@
 //! Execution logic for the `sentinel scan` CLI command.
 
 use std::fs;
+#[cfg(feature = "tui")]
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use sentinel_core::error::SentinelError;
 use sentinel_core::usecases::{ScanContractUseCase, ScanRequest};
 
 use crate::args::ScanArgs;
-use crate::formatters::{render_json_with_diff, render_text_with_diff};
+use crate::formatters::{render_csv, render_json_with_diff, render_sarif, render_text_with_diff};
 
 /// Exit code: All evaluated storage entries have status OK.
 pub const EXIT_OK: i32 = 0;
@@ -121,7 +123,78 @@ pub fn load_and_validate_baseline(
 }
 
 /// Executes the contract scan command and returns the appropriate UNIX exit code.
+/// Verifies that `--output` points to a writable file location without
+/// truncating an existing file. The actual write still happens after a
+/// successful scan and overwrites/truncates the destination.
+fn validate_output_path(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() {
+        return Err("--output path must not be empty".to_string());
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            return Err(format!(
+                "--output parent directory '{}' does not exist",
+                parent.display()
+            ));
+        }
+    }
+
+    if path.is_dir() {
+        return Err(format!("--output path '{}' is a directory", path.display()));
+    }
+
+    if path.exists() {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("--output path '{}' is not writable: {}", path.display(), e))?;
+    } else {
+        let file = fs::File::create(path)
+            .map_err(|e| format!("--output path '{}' is not writable: {}", path.display(), e))?;
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+
+    Ok(())
+}
+
 pub async fn run_scan(args: ScanArgs) -> i32 {
+    #[cfg(not(feature = "tui"))]
+    if args.tui {
+        eprintln!(
+            "Error: --tui requires the CLI to be built with the `tui` feature (rebuild with `cargo install --path crates/sentinel-cli --features tui` or `cargo build -p sentinel-cli --features tui`)"
+        );
+        return EXIT_INVALID_ARGS;
+    }
+
+    #[cfg(feature = "tui")]
+    {
+        if args.tui && !std::io::stdout().is_terminal() {
+            eprintln!("Error: --tui requires an interactive TTY, but stdout is not a terminal");
+            return EXIT_INVALID_ARGS;
+        }
+        if args.tui && args.baseline.is_some() {
+            eprintln!("Error: --tui cannot be combined with --baseline");
+            return EXIT_INVALID_ARGS;
+        }
+    }
+
+    let format = args.format.to_lowercase();
+
+    if format == "csv" && args.baseline.is_some() {
+        eprintln!("Error: --baseline is not supported with --format csv");
+        return EXIT_INVALID_ARGS;
+    }
+
+    if let Some(ref path) = args.output {
+        if let Err(err) = validate_output_path(path) {
+            eprintln!("Error: {}", err);
+            return EXIT_INVALID_ARGS;
+        }
+    }
+
     // 1. Validate argument bounds before making any RPC calls
     if let Some(timeout) = args.rpc_timeout {
         if !(1..=120).contains(&timeout) {
@@ -219,16 +292,24 @@ pub async fn run_scan(args: ScanArgs) -> i32 {
         }
     };
 
+    #[cfg(feature = "tui")]
+    if args.tui {
+        return crate::commands::tui::run_tui(report, threshold_config, &args.network);
+    }
+    crate::telemetry::record_scan_metrics(&report);
+
     let baseline_diff = baseline_snapshot
         .as_ref()
         .map(|b| compare_reports(&report, b));
 
-    let output_result = match args.format.to_lowercase().as_str() {
+    let output_result = match format.as_str() {
         "text" => Ok(render_text_with_diff(&report, baseline_diff.as_ref())),
         "json" => render_json_with_diff(&report, baseline_diff.clone()),
+        "csv" => render_csv(&report),
+        "sarif" => render_sarif(&report),
         other => {
             eprintln!(
-                "Error: Unsupported format '{}'. Supported formats: text, json",
+                "Error: Unsupported format '{}'. Supported formats: text, json, csv, sarif",
                 other
             );
             return EXIT_INVALID_ARGS;
@@ -237,7 +318,18 @@ pub async fn run_scan(args: ScanArgs) -> i32 {
 
     match output_result {
         Ok(output) => {
-            println!("{}", output);
+            if let Some(path) = args.output.as_deref() {
+                let contents = format!("{}\n", output.trim_end_matches('\n'));
+                if let Err(err) = fs::write(path, contents) {
+                    eprintln!("Error: failed to write --output '{}': {}", path, err);
+                    return EXIT_INVALID_ARGS;
+                }
+            } else if format == "csv" {
+                // The CSV writer already terminates every record; avoid a blank line.
+                println!("{}", output.trim_end_matches('\n'));
+            } else {
+                println!("{}", output);
+            }
 
             let diff_has_regression = baseline_diff
                 .as_ref()
