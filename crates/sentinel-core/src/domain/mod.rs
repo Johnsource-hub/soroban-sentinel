@@ -4,6 +4,7 @@ pub mod bundle;
 pub mod cold_storage;
 pub mod compare;
 pub mod entry;
+pub mod footprint;
 pub mod risk;
 pub mod scenario;
 pub mod ttl;
@@ -16,6 +17,7 @@ pub use compare::{
     ChangeCategory, EntryDiff, MAX_BASELINE_FILE_BYTES,
 };
 pub use entry::{Durability, EntryType, StorageEntry};
+pub use footprint::{AtRiskFootprint, FootprintAccess, FootprintValidation, FootprintValidator};
 pub use risk::{
     evaluate_risk, RiskLevel, ThresholdConfig, DEFAULT_CRITICAL_LEDGERS, DEFAULT_WARNING_LEDGERS,
 };

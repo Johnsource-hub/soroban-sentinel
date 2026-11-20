@@ -1,14 +1,19 @@
+
 #![forbid(unsafe_code)]
 
 use clap::Parser;
 use sentinel_cli::args::{Cli, Commands};
-use sentinel_cli::commands::{run_bundle, run_scan, EXIT_INVALID_ARGS};
-use sentinel_cli::commands::{run_check, run_scan, EXIT_INVALID_ARGS};
+use sentinel_cli::commands::{
+    run_bundle,
+    run_check,
+    run_scan,
+    EXIT_INVALID_ARGS,
+};
 
 #[tokio::main]
 async fn main() {
     let cli = match Cli::try_parse() {
-        Ok(c) => c,
+        Ok(cli) => cli,
         Err(err) => {
             if err.use_stderr() {
                 let _ = err.print();

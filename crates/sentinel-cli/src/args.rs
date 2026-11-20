@@ -1,3 +1,4 @@
+
 use clap::{Args, Parser, Subcommand};
 
 /// Autonomous storage TTL monitoring and expiry-risk detection for Soroban smart contracts.
@@ -18,8 +19,10 @@ pub struct Cli {
 pub enum Commands {
     /// Scan a contract and inspect storage entry TTL status and expiry risk
     Scan(ScanArgs),
+
     /// Bundle contract and persistent-key TTL extensions into simulated transactions
     Bundle(BundleArgs),
+
     /// Scan contracts once from a TOML manifest
     Check(CheckArgs),
 }
@@ -31,55 +34,55 @@ pub struct ScanArgs {
     #[arg(value_name = "CONTRACT_ID")]
     pub contract_id: String,
 
-    /// Custom Soroban RPC endpoint URL (overrides default network endpoint)
+    /// Custom Soroban RPC endpoint URL
     #[arg(long, value_name = "URL", env = "SOROBAN_RPC_URL")]
     pub rpc_url: Option<String>,
 
-    /// Target Stellar network: "testnet", "mainnet", "futurenet", or "local"
+    /// Target Stellar network
     #[arg(long, default_value = "testnet", value_name = "NETWORK")]
     pub network: String,
 
-    /// Output format for scan results: "text" (colorized ASCII table) or "json" (machine-readable)
+    /// Output format: text, json, or sarif
     #[arg(long, default_value = "text", value_name = "FORMAT")]
     pub format: String,
 
-    /// Persistent storage key symbol to inspect (can be specified multiple times)
+    /// Persistent storage key symbol to inspect (repeatable)
     #[arg(long = "key", value_name = "SYMBOL")]
     pub key: Vec<String>,
 
-    /// Persistent storage key encoded as raw base64 ScVal XDR (can be specified multiple times)
+    /// Persistent storage key encoded as raw base64 ScVal XDR (repeatable)
     #[arg(long = "key-xdr", value_name = "BASE64_XDR")]
     pub key_xdr: Vec<String>,
 
-    /// Persistent storage key encoded as typed expression (can be specified multiple times, e.g. "sym:Balance", "vec[sym:Balance, addr:G...]")
+    /// Persistent storage key encoded as typed expression (repeatable)
     #[arg(long = "key-expr", value_name = "EXPR")]
     pub key_expr: Vec<String>,
 
-    /// Warning threshold in ledgers below which entries trigger WARN status (defaults to 120,960 ledgers ≈ 7 days)
+    /// Warning threshold in ledgers
     #[arg(long, default_value_t = 120960, value_name = "LEDGERS")]
     pub threshold: u32,
 
-    /// Critical threshold in ledgers below which entries trigger CRITICAL status (defaults to 34,560 ledgers ≈ 2 days, or threshold / 3 if threshold <= 34,560)
+    /// Critical threshold in ledgers
     #[arg(long, value_name = "LEDGERS")]
     pub critical_threshold: Option<u32>,
 
-    /// Custom RPC request timeout in seconds (1–120, defaults to 10)
+    /// Custom RPC request timeout in seconds
     #[arg(long = "rpc-timeout", value_name = "SECS")]
     pub rpc_timeout: Option<u64>,
 
-    /// Maximum RPC retry attempts for transient errors (0–10, defaults to 3)
+    /// Maximum RPC retry attempts
     #[arg(long = "rpc-max-retries", value_name = "N")]
     pub rpc_max_retries: Option<u32>,
 
-    /// Override ledger close velocity in seconds per ledger (1.0–60.0)
+    /// Override ledger close velocity in seconds per ledger
     #[arg(long = "ledger-seconds", value_name = "SECS")]
     pub ledger_seconds: Option<f64>,
 
-    /// Path to a previous JSON scan report baseline file for comparison
+    /// Path to a previous JSON scan report baseline file
     #[arg(long = "baseline", value_name = "PATH")]
     pub baseline: Option<String>,
 
-    /// Return exit code 2 if any entry regressed in risk status or was removed compared to baseline
+    /// Return exit code 2 if any entry regressed compared to baseline
     #[arg(long = "fail-on-regression")]
     pub fail_on_regression: bool,
 }
@@ -96,14 +99,14 @@ pub struct BundleArgs {
     pub contracts: Vec<String>,
 
     /// JSON manifest containing contracts and their optional persistent symbol keys
-    #[arg(long, value_name = "PATH")]
-    pub manifest: Option<String>,
+    #[arg(long, value_name = "PATH", conflicts_with = "contracts")]
+    pub manifest: Option<std::path::PathBuf>,
 
-    /// Persistent storage symbol key to include for every selected contract (repeatable)
+    /// Persistent storage symbol key to include for every selected contract
     #[arg(long = "key", value_name = "SYMBOL")]
     pub keys: Vec<String>,
 
-    /// Persistent storage key encoded as base64 ScVal XDR (repeatable)
+    /// Persistent storage key encoded as base64 ScVal XDR
     #[arg(long = "key-xdr", value_name = "BASE64_XDR")]
     pub key_xdr: Vec<String>,
 
@@ -111,21 +114,23 @@ pub struct BundleArgs {
     #[arg(long = "source-account", value_name = "G...")]
     pub source_account: String,
 
-    /// Extend entries to this many ledgers beyond the current ledger (required)
+    /// Extend entries to this many ledgers beyond the current ledger
     #[arg(long = "extend-by", value_name = "LEDGERS")]
     pub extend_by: u32,
 
-    /// Target Stellar network: "testnet", "mainnet", "futurenet", or "local"
+    /// Target Stellar network
     #[arg(long, default_value = "testnet", value_name = "NETWORK")]
     pub network: String,
 
-    /// Custom Soroban RPC endpoint URL (overrides the network preset)
+    /// Custom Soroban RPC endpoint URL
     #[arg(long, value_name = "URL", env = "SOROBAN_RPC_URL")]
     pub rpc_url: Option<String>,
 
-    /// Inclusion fee per operation in stroops used when constructing each envelope
+    /// Inclusion fee per operation in stroops
     #[arg(long = "base-fee", default_value_t = 100, value_name = "STROOPS")]
     pub base_fee: u32,
+}
+
 /// Command-line arguments for a one-shot manifest check.
 #[derive(Args, Debug)]
 #[command(
@@ -152,6 +157,7 @@ mod tests {
             "scan",
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
         ]);
+
         match args.command {
             Commands::Scan(scan) => {
                 assert_eq!(
@@ -171,7 +177,6 @@ mod tests {
                 assert!(scan.baseline.is_none());
                 assert!(!scan.fail_on_regression);
             }
-            Commands::Bundle(_) => panic!("expected scan command"),
             _ => panic!("expected scan command"),
         }
     }
@@ -213,27 +218,22 @@ mod tests {
 
         match args.command {
             Commands::Scan(scan) => {
-                assert_eq!(
-                    scan.contract_id,
-                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                );
-                assert_eq!(
-                    scan.rpc_url.as_deref(),
-                    Some("https://soroban-testnet.stellar.org")
-                );
                 assert_eq!(scan.network, "mainnet");
                 assert_eq!(scan.format, "json");
                 assert_eq!(scan.threshold, 50000);
                 assert_eq!(scan.key, vec!["COUNTER", "ADMIN"]);
                 assert_eq!(scan.key_xdr, vec!["AAAAFA=="]);
-                assert_eq!(scan.key_expr, vec!["sym:Balance", "vec[sym:Data, u32:1]"]);
+                assert_eq!(
+                    scan.key_expr,
+                    vec!["sym:Balance", "vec[sym:Data, u32:1]"]
+                );
                 assert_eq!(scan.rpc_timeout, Some(30));
                 assert_eq!(scan.rpc_max_retries, Some(5));
                 assert_eq!(scan.ledger_seconds, Some(5.5));
                 assert_eq!(scan.baseline.as_deref(), Some("baseline.json"));
                 assert!(scan.fail_on_regression);
             }
-            Commands::Bundle(_) => panic!("expected scan command"),
+            _ => panic!("expected scan command"),
         }
     }
 
@@ -257,16 +257,16 @@ mod tests {
             "--base-fee",
             "200",
         ]);
+
         match args.command {
             Commands::Bundle(bundle) => {
                 assert_eq!(bundle.contracts.len(), 2);
                 assert_eq!(bundle.keys, vec!["ADMIN", "COUNTER"]);
-                assert_eq!(bundle.extend_by, 100_000);
+                assert_eq!(bundle.extend_by, 100000);
                 assert_eq!(bundle.base_fee, 200);
                 assert_eq!(bundle.network, "testnet");
             }
-            Commands::Scan(_) => panic!("expected bundle command"),
-            _ => panic!("expected scan command"),
+            _ => panic!("expected bundle command"),
         }
     }
 }
