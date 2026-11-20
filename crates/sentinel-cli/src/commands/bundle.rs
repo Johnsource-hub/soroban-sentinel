@@ -30,13 +30,12 @@ fn resolve_contracts(args: &BundleArgs) -> Result<Vec<ContractInput>, BundleComm
             )));
         }
 
-        let manifest: BundleManifest =
-            serde_json::from_slice(&contents).map_err(|error| {
-                BundleCommandError::Invalid(format!(
-                    "invalid JSON bundle manifest '{}': {error}",
-                    path.display()
-                ))
-            })?;
+        let manifest: BundleManifest = serde_json::from_slice(&contents).map_err(|error| {
+            BundleCommandError::Invalid(format!(
+                "invalid JSON bundle manifest '{}': {error}",
+                path.display()
+            ))
+        })?;
 
         for entry in manifest.contracts {
             merge_contract(
