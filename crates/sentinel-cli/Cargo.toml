@@ -22,11 +22,18 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 comfy-table.workspace = true
+csv.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
 stellar-xdr.workspace = true
 stellar-strkey.workspace = true
 toml = "0.8"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
